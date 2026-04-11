@@ -11,8 +11,9 @@ tmux overlay-image clear
 ```
 
 `set` places a static sixel image at screen cell (X, Y). PNG files with alpha
-are automatically converted. `animate` loads an animated GIF, WebP, or APNG
-and plays it in-place using per-frame durations from the file metadata.
+are loaded natively via libpng — no external tools required. `animate` loads
+an animated GIF and plays it in-place using per-frame durations from the file
+metadata.
 
 `-W`/`-H` scale to the given number of terminal columns/rows.
 
@@ -50,4 +51,5 @@ tmux overlay-image animate 5 2 tools/thinking.gif -W 8 -H 4
 ```
 
 ## Requirements
-- Python 3 with Pillow (`pip install Pillow`)
+- giflib 5.x for `animate` (`brew install giflib` or `apt install libgif-dev`)
+- libpng for `set` with PNG (`brew install libpng` or `apt install libpng-dev`)

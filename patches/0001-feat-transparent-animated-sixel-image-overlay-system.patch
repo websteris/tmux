@@ -9,7 +9,7 @@ on the terminal, outside any pane, with live content showing through.
 New files:
 - cmd-overlay-image.c: 'overlay-image set X Y FILE [-W cols] [-H rows]',
   'overlay-image animate X Y FILE [-W cols] [-H rows]', and
-  'overlay-image clear'.  PNG handled via png_to_sixel.py; animated GIF
+  'overlay-image clear'.  PNG handled natively via libpng; animated GIF
   decoded natively via giflib with per-frame durations.
 - image-overlay.c: image_overlay_set/clear/draw/animate.  Animation uses
   libevent timers with per-frame durations from the file metadata.
@@ -30,8 +30,8 @@ Modified files:
 - screen-write.c / input.c: sixel plumbing
 ---
 diff --git a/Makefile.am b/Makefile.am
---- a/Makefile.am	2026-04-10 22:22:29.887163248 -0600
-+++ b/Makefile.am	2026-04-10 22:22:24.699569784 -0600
+--- a/Makefile.am
++++ b/Makefile.am
 @@ -114,6 +114,7 @@
  	cmd-load-buffer.c \
  	cmd-lock-server.c \
@@ -48,12 +48,11 @@ diff --git a/Makefile.am b/Makefile.am
  	input-keys.c \
  	input.c \
  	job.c \
-diff --git a/tmp/tmux_pgen/b/cmd-overlay-image.c b/tmp/tmux_pgen/b/cmd-overlay-image.c
+diff --git a/cmd-overlay-image.c b/cmd-overlay-image.c
 new file mode 100644
-index 0000000..20733bc
---- /dev/null
-+++ b/tmp/tmux_pgen/b/cmd-overlay-image.c
-@@ -0,0 +1,325 @@
+--- a/cmd-overlay-image.c
++++ b/cmd-overlay-image.c
+@@ -0,0 +1,299 @@
 +/* $OpenBSD$ */
 +
 +/*
@@ -222,17 +221,17 @@ index 0000000..20733bc
 +
 +	xpath = args_string(args, 3);
 +
-+	/* Check for PNG by extension and use python encoder for transparency. */
++#ifdef HAVE_LIBPNG
++	/* PNG: load natively with libpng and return a sixel_image directly. */
 +	{
 +		const char	*ext = strrchr(xpath, '.');
 +		if (ext != NULL && strcasecmp(ext, ".png") == 0) {
-+			char	 cmd[PATH_MAX + 128];
-+			FILE	*pp;
-+			char	*tmp;
-+			size_t	 cap, nread;
++			const char	*pngerr;
 +
 +			wopt = args_get(args, 'W');
 +			hopt = args_get(args, 'H');
++			pw = 0;
++			ph = 0;
 +			if (wopt != NULL || hopt != NULL) {
 +				cell_px = (tc->tty.xpixel > 0) ? tc->tty.xpixel : 8;
 +				cell_py = (tc->tty.ypixel > 0) ? tc->tty.ypixel : 16;
@@ -250,80 +249,54 @@ index 0000000..20733bc
 +				}
 +				pw = (wopt != NULL) ? (u_int)wcols * cell_px : 0;
 +				ph = (hopt != NULL) ? (u_int)hrows * cell_py : 0;
-+				if (pw > 0 && ph > 0) {
-+					snprintf(cmd, sizeof cmd,
-+					    "python3 /home/user/.claude/hooks/png_to_sixel.py '%s' --width %u --height %u",
-+					    xpath, pw, ph);
-+				} else if (pw > 0) {
-+					snprintf(cmd, sizeof cmd,
-+					    "python3 /home/user/.claude/hooks/png_to_sixel.py '%s' --width %u",
-+					    xpath, pw);
-+				} else {
-+					snprintf(cmd, sizeof cmd,
-+					    "python3 /home/user/.claude/hooks/png_to_sixel.py '%s' --height %u",
-+					    xpath, ph);
-+				}
-+			} else {
-+				snprintf(cmd, sizeof cmd,
-+				    "python3 /home/user/.claude/hooks/png_to_sixel.py '%s'",
-+				    xpath);
 +			}
-+			pp = popen(cmd, "r");
-+			if (pp == NULL) {
-+				cmdq_error(item, "%s: popen failed: %s",
-+				    xpath, strerror(errno));
++			si = image_load_png(xpath, pw, ph,
++			    tc->tty.xpixel, tc->tty.ypixel, &pngerr);
++			if (si == NULL) {
++				cmdq_error(item, "%s: %s", xpath,
++				    pngerr != NULL ? pngerr : "failed to load PNG");
 +				return (CMD_RETURN_ERROR);
 +			}
-+
-+			cap = 65536;
-+			buf = xmalloc(cap);
-+			len = 0;
-+			for (;;) {
-+				if (len + 4096 > cap) {
-+					cap *= 2;
-+					tmp = xrealloc(buf, cap);
-+					buf = tmp;
-+				}
-+				nread = fread(buf + len, 1, 4096, pp);
-+				if (nread == 0)
-+					break;
-+				len += nread;
-+			}
-+			pclose(pp);
-+
-+			if (len == 0) {
-+				cmdq_error(item, "%s: png encoder produced no output",
-+				    xpath);
-+				free(buf);
-+				return (CMD_RETURN_ERROR);
-+			}
-+		} else {
-+			if (stat(xpath, &st) != 0) {
-+				cmdq_error(item, "%s: %s", xpath, strerror(errno));
-+				return (CMD_RETURN_ERROR);
-+			}
-+			len = (size_t)st.st_size;
-+			if (len == 0) {
-+				cmdq_error(item, "%s: empty file", xpath);
-+				return (CMD_RETURN_ERROR);
-+			}
-+
-+			f = fopen(xpath, "rb");
-+			if (f == NULL) {
-+				cmdq_error(item, "%s: %s", xpath, strerror(errno));
-+				return (CMD_RETURN_ERROR);
-+			}
-+
-+			buf = xmalloc(len);
-+			if (fread(buf, 1, len, f) != len) {
-+				cmdq_error(item, "%s: read error", xpath);
-+				free(buf);
-+				fclose(f);
-+				return (CMD_RETURN_ERROR);
-+			}
-+			fclose(f);
++			image_overlay_set(tc, si, (u_int)x, (u_int)y);
++			return (CMD_RETURN_NORMAL);
 +		}
 +	}
++#else
++	{
++		const char	*ext = strrchr(xpath, '.');
++		if (ext != NULL && strcasecmp(ext, ".png") == 0) {
++			cmdq_error(item, "overlay-image set with .png requires "
++			    "libpng (rebuild tmux with libpng installed)");
++			return (CMD_RETURN_ERROR);
++		}
++	}
++#endif
++
++	/* Sixel file: read raw bytes then parse. */
++	if (stat(xpath, &st) != 0) {
++		cmdq_error(item, "%s: %s", xpath, strerror(errno));
++		return (CMD_RETURN_ERROR);
++	}
++	len = (size_t)st.st_size;
++	if (len == 0) {
++		cmdq_error(item, "%s: empty file", xpath);
++		return (CMD_RETURN_ERROR);
++	}
++
++	f = fopen(xpath, "rb");
++	if (f == NULL) {
++		cmdq_error(item, "%s: %s", xpath, strerror(errno));
++		return (CMD_RETURN_ERROR);
++	}
++
++	buf = xmalloc(len);
++	if (fread(buf, 1, len, f) != len) {
++		cmdq_error(item, "%s: read error", xpath);
++		free(buf);
++		fclose(f);
++		return (CMD_RETURN_ERROR);
++	}
++	fclose(f);
 +
 +	/*
 +	 * sixel_parse expects the buffer to start with 'q' (the DCS final
@@ -399,8 +372,8 @@ diff --git a/cmd.c b/cmd.c
  	&cmd_pipe_pane_entry,
  	&cmd_previous_layout_entry,
 diff --git a/configure.ac b/configure.ac
---- a/configure.ac	2026-04-10 22:23:09.616281967 -0600
-+++ b/configure.ac	2026-04-10 22:22:24.703589972 -0600
+--- a/configure.ac
++++ b/configure.ac
 @@ -471,6 +471,21 @@
  fi
  AM_CONDITIONAL(ENABLE_SIXEL, [test "x$enable_sixel" = xyes])
@@ -421,13 +394,12 @@ diff --git a/configure.ac b/configure.ac
 +fi
 +AM_CONDITIONAL(HAVE_GIFLIB, [test "x$found_giflib" = xyes])
  
- # Check for b64_ntop. If we have b64_ntop, we assume b64_pton as well.
- AC_MSG_CHECKING(for b64_ntop)
-diff --git a/tmp/tmux_pgen/b/image-gif.c b/tmp/tmux_pgen/b/image-gif.c
+ # PNG support via libpng (optional; enables native PNG loading for overlay-image set).
+ PKG_CHECK_MODULES(
+diff --git a/image-gif.c b/image-gif.c
 new file mode 100644
-index 0000000..a384414
---- /dev/null
-+++ b/tmp/tmux_pgen/b/image-gif.c
+--- a/image-gif.c
++++ b/image-gif.c
 @@ -0,0 +1,230 @@
 +/* $OpenBSD$ */
 +
@@ -659,11 +631,10 @@ index 0000000..a384414
 +}
 +
 +#endif /* HAVE_GIFLIB */
-diff --git a/tmp/tmux_pgen/b/image-overlay.c b/tmp/tmux_pgen/b/image-overlay.c
+diff --git a/image-overlay.c b/image-overlay.c
 new file mode 100644
-index 0000000..766ba56
---- /dev/null
-+++ b/tmp/tmux_pgen/b/image-overlay.c
+--- a/image-overlay.c
++++ b/image-overlay.c
 @@ -0,0 +1,178 @@
 +/* $OpenBSD$ */
 +
@@ -843,6 +814,166 @@ index 0000000..766ba56
 +		}
 +	}
 +}
+diff --git a/image-png.c b/image-png.c
+new file mode 100644
+--- a/image-png.c
++++ b/image-png.c
+@@ -0,0 +1,155 @@
++/* $OpenBSD$ */
++
++/*
++ * Copyright (c) 2024 Thomas Adam <thomas@xteddy.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
++ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifdef HAVE_LIBPNG
++
++#include <sys/types.h>
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <png.h>
++
++#include "tmux.h"
++
++/*
++ * Load a PNG file with alpha channel and convert it to a sixel_image.
++ *
++ * pw, ph: target pixel dimensions; 0 means use the image's natural size.
++ * If only one dimension is given (the other is 0), the missing dimension is
++ * computed from the image's aspect ratio.
++ *
++ * Returns NULL on error and sets *errp to a descriptive string.
++ */
++struct sixel_image *
++image_load_png(const char *path, u_int pw, u_int ph,
++    u_int xpixel, u_int ypixel, const char **errp)
++{
++	FILE		   *fp;
++	png_structp	    png;
++	png_infop	    info;
++	u_int		    w, h, y, dx, dy, sx, sy;
++	/* volatile: these are modified after setjmp; must survive longjmp. */
++	volatile u_int	    tw, th;
++	u_char		  **rows, *rgba, *scaled;
++	struct sixel_image *si;
++	int		    bit_depth, color_type;
++
++	tw = pw;
++	th = ph;
++
++	*errp = NULL;
++
++	fp = fopen(path, "rb");
++	if (fp == NULL) {
++		*errp = strerror(errno);
++		return (NULL);
++	}
++
++	png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
++	if (png == NULL) {
++		*errp = "png_create_read_struct failed";
++		fclose(fp);
++		return (NULL);
++	}
++
++	info = png_create_info_struct(png);
++	if (info == NULL) {
++		*errp = "png_create_info_struct failed";
++		png_destroy_read_struct(&png, NULL, NULL);
++		fclose(fp);
++		return (NULL);
++	}
++
++	if (setjmp(png_jmpbuf(png))) {
++		*errp = "PNG decode error";
++		png_destroy_read_struct(&png, &info, NULL);
++		fclose(fp);
++		return (NULL);
++	}
++
++	png_init_io(png, fp);
++	png_read_info(png, info);
++
++	w          = png_get_image_width(png, info);
++	h          = png_get_image_height(png, info);
++	bit_depth  = png_get_bit_depth(png, info);
++	color_type = png_get_color_type(png, info);
++
++	/* Normalise to RGBA 8-bit. */
++	if (color_type == PNG_COLOR_TYPE_PALETTE)
++		png_set_palette_to_rgb(png);
++	if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
++		png_set_expand_gray_1_2_4_to_8(png);
++	if (png_get_valid(png, info, PNG_INFO_tRNS))
++		png_set_tRNS_to_alpha(png);
++	if (bit_depth == 16)
++		png_set_strip_16(png);
++	if (color_type == PNG_COLOR_TYPE_GRAY ||
++	    color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
++		png_set_gray_to_rgb(png);
++	/* Add alpha channel for non-alpha colour types. */
++	if (color_type == PNG_COLOR_TYPE_RGB ||
++	    color_type == PNG_COLOR_TYPE_GRAY ||
++	    color_type == PNG_COLOR_TYPE_PALETTE)
++		png_set_filler(png, 0xff, PNG_FILLER_AFTER);
++
++	png_read_update_info(png, info);
++
++	rgba = xmalloc((size_t)w * h * 4);
++	rows = xmalloc(h * sizeof *rows);
++	for (y = 0; y < h; y++)
++		rows[y] = rgba + y * w * 4;
++
++	png_read_image(png, (png_bytepp)rows);
++	png_read_end(png, NULL);
++	png_destroy_read_struct(&png, &info, NULL);
++	fclose(fp);
++	free(rows);
++
++	/* Resolve a partial target size from the image's aspect ratio. */
++	if (tw == 0 && th > 0 && h > 0)
++		tw = th * w / h;
++	else if (th == 0 && tw > 0 && w > 0)
++		th = tw * h / w;
++
++	if (tw > 0 && th > 0 && (tw != w || th != h)) {
++		scaled = xmalloc((size_t)tw * th * 4);
++		for (dy = 0; dy < th; dy++) {
++			sy = dy * h / th;
++			for (dx = 0; dx < tw; dx++) {
++				sx = dx * w / tw;
++				memcpy(scaled + (dy * tw + dx) * 4,
++				    rgba + (sy * w + sx) * 4, 4);
++			}
++		}
++		free(rgba);
++		si = sixel_from_rgba(scaled, tw, th, xpixel, ypixel);
++		free(scaled);
++	} else {
++		si = sixel_from_rgba(rgba, w, h, xpixel, ypixel);
++		free(rgba);
++	}
++
++	if (si == NULL)
++		*errp = "sixel encode failed";
++	return (si);
++}
++
++#endif /* HAVE_LIBPNG */
 diff --git a/input.c b/input.c
 --- a/input.c	2026-04-10 22:22:29.887163248 -0600
 +++ b/input.c	2026-04-10 22:22:24.707610162 -0600
@@ -974,11 +1105,10 @@ diff --git a/screen-write.c b/screen-write.c
  	ttyctx.ptr = image_store(s, si);
  
  	tty_write(tty_cmd_sixelimage, &ttyctx);
-diff --git a/tmp/tmux_pgen/b/sixel-enc.c b/tmp/tmux_pgen/b/sixel-enc.c
+diff --git a/sixel-enc.c b/sixel-enc.c
 new file mode 100644
-index 0000000..f2aba6b
---- /dev/null
-+++ b/tmp/tmux_pgen/b/sixel-enc.c
+--- a/sixel-enc.c
++++ b/sixel-enc.c
 @@ -0,0 +1,311 @@
 +/* $OpenBSD$ */
 +
@@ -1292,18 +1422,17 @@ index 0000000..f2aba6b
 +	return (si);
 +}
 diff --git a/tmux.h b/tmux.h
---- a/tmux.h	2026-04-10 22:23:09.616281967 -0600
-+++ b/tmux.h	2026-04-10 22:22:24.703589972 -0600
-@@ -2187,6 +2187,8 @@
+--- a/tmux.h
++++ b/tmux.h
+@@ -2187,6 +2187,7 @@
  	void			*overlay_data;
  	struct event		 overlay_timer;
  
 +	struct image_overlay	*image_overlay;
-+
+ 
  	struct client_files	 files;
  	u_int			 source_file_depth;
- 
-@@ -2687,6 +2689,8 @@
+@@ -2688,6 +2689,8 @@
  
  #ifdef ENABLE_SIXEL
  void	tty_draw_images(struct client *, struct window_pane *, struct screen *);
@@ -1312,7 +1441,7 @@ diff --git a/tmux.h b/tmux.h
  #endif
  
  void	tty_sync_start(struct tty *);
-@@ -3066,6 +3070,25 @@
+@@ -3067,6 +3070,32 @@
  void	 server_client_remove_pane(struct window_pane *);
  void	 server_client_print(struct client *, int, struct evbuffer *);
  
@@ -1326,18 +1455,25 @@ diff --git a/tmux.h b/tmux.h
 +#endif
 +
 +/* sixel-enc.c */
-+#ifdef HAVE_GIFLIB
++#if defined(HAVE_GIFLIB) || defined(HAVE_LIBPNG)
 +char		*sixel_encode_rgba(const u_char *, u_int, u_int, size_t *);
 +struct sixel_image *sixel_from_rgba(const u_char *, u_int, u_int, u_int, u_int);
++#endif
 +
 +/* image-gif.c */
++#ifdef HAVE_GIFLIB
 +u_int		 image_load_gif(const char *, u_int, u_int, u_int, u_int,
 +		     struct sixel_image ***, u_int **, const char **);
 +#endif
 +
++/* image-png.c */
++#ifdef HAVE_LIBPNG
++struct sixel_image *image_load_png(const char *, u_int, u_int, u_int, u_int,
++		     const char **);
++#endif
+ 
  /* server-fn.c */
  void	 server_redraw_client(struct client *);
- void	 server_status_client(struct client *);
 diff --git a/tty.c b/tty.c
 --- a/tty.c	2026-04-10 22:22:29.887163248 -0600
 +++ b/tty.c	2026-04-10 22:22:24.715650540 -0600
