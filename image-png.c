@@ -47,7 +47,9 @@ image_load_png(const char *path, u_int pw, u_int ph,
 	u_int		    w, h, y, dx, dy, sx, sy;
 	/* volatile: these are modified after setjmp; must survive longjmp. */
 	volatile u_int	    tw, th;
-	u_char		  **rows, *rgba, *scaled;
+	u_char		  * volatile rgba = NULL;
+	u_char		  ** volatile rows = NULL;
+	u_char		  *scaled;
 	struct sixel_image *si;
 	int		    bit_depth, color_type;
 
@@ -79,6 +81,8 @@ image_load_png(const char *path, u_int pw, u_int ph,
 
 	if (setjmp(png_jmpbuf(png))) {
 		*errp = "PNG decode error";
+		free(rows);
+		free(rgba);
 		png_destroy_read_struct(&png, &info, NULL);
 		fclose(fp);
 		return (NULL);
@@ -115,7 +119,7 @@ image_load_png(const char *path, u_int pw, u_int ph,
 	rgba = xmalloc((size_t)w * h * 4);
 	rows = xmalloc(h * sizeof *rows);
 	for (y = 0; y < h; y++)
-		rows[y] = rgba + y * w * 4;
+		rows[y] = rgba + (size_t)y * w * 4;
 
 	png_read_image(png, (png_bytepp)rows);
 	png_read_end(png, NULL);

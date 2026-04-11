@@ -580,6 +580,8 @@ new file mode 100644
 +					idx = img->RasterBits[y * fw + x];
 +					if ((int)idx == trans_idx)
 +						continue;	/* keep canvas pixel */
++					if (idx >= (unsigned)cmap->ColorCount)
++						continue;
 +					cp    = canvas + ((fy + y) * lw + (fx + x)) * 4;
 +					cp[0] = colors[idx].Red;
 +					cp[1] = colors[idx].Green;
@@ -872,7 +874,7 @@ new file mode 100644
 +	u_int		    w, h, y, dx, dy, sx, sy;
 +	/* volatile: these are modified after setjmp; must survive longjmp. */
 +	volatile u_int	    tw, th;
-+	u_char		  **rows, *rgba, *scaled;
++	u_char		  **volatile rows = NULL, *volatile rgba = NULL, *scaled;
 +	struct sixel_image *si;
 +	int		    bit_depth, color_type;
 +
@@ -904,6 +906,8 @@ new file mode 100644
 +
 +	if (setjmp(png_jmpbuf(png))) {
 +		*errp = "PNG decode error";
++		free(rows);
++		free(rgba);
 +		png_destroy_read_struct(&png, &info, NULL);
 +		fclose(fp);
 +		return (NULL);
@@ -940,7 +944,7 @@ new file mode 100644
 +	rgba = xmalloc((size_t)w * h * 4);
 +	rows = xmalloc(h * sizeof *rows);
 +	for (y = 0; y < h; y++)
-+		rows[y] = rgba + y * w * 4;
++		rows[y] = rgba + (size_t)y * w * 4;
 +
 +	png_read_image(png, (png_bytepp)rows);
 +	png_read_end(png, NULL);
@@ -985,20 +989,14 @@ diff --git a/input.c b/input.c
  	}
  
  #ifdef ENABLE_SIXEL
-+	log_debug("%s: buf len=%zu buf[0]=%02x wp=%s", __func__, len,
-+	    len > 0 ? (unsigned char)buf[0] : 0, wp != NULL ? "set" : "NULL");
  	if (wp != NULL && buf[0] == 'q' && ictx->interm_len == 0) {
  		w = wp->window;
-+		log_debug("%s: entering sixel parse, w->xpixel=%u w->ypixel=%u",
-+		    __func__, w->xpixel, w->ypixel);
  		if (input_split(ictx) != 0)
  			return (0);
  		p2 = input_get(ictx, 1, 0, 0);
  		if (p2 == -1)
  			p2 = 0;
  		si = sixel_parse(buf, len, p2, w->xpixel, w->ypixel);
-+		log_debug("%s: sixel_parse returned %s", __func__,
-+		    si != NULL ? "image" : "NULL");
  		if (si != NULL)
  			screen_write_sixelimage(sctx, si, ictx->cell.cell.bg);
  	}
@@ -1286,10 +1284,10 @@ new file mode 100644
 +	/* Pass 1: assign palette registers to unique opaque colors. */
 +	for (y = 0; y < h; y++) {
 +		for (x = 0; x < w; x++) {
-+			p = rgba + (y * w + x) * 4;
++			p = rgba + ((size_t)y * w + x) * 4;
 +			a = p[3];
 +			if (a < 128) {
-+				regmap[y * w + x] = 0;
++				regmap[(size_t)y * w + x] = 0;
 +				continue;
 +			}
 +			r   = p[0]; g = p[1]; b = p[2];
@@ -1307,7 +1305,7 @@ new file mode 100644
 +					reg = nearest_reg(palr, palg, palb,
 +					    ncolors, r, g, b);
 +			}
-+			regmap[y * w + x] = reg;
++			regmap[(size_t)y * w + x] = reg;
 +		}
 +	}
 +	free(ht);
@@ -1345,7 +1343,7 @@ new file mode 100644
 +			for (x = 0; x < w; x++) {
 +				bits = 0;
 +				for (bi = 0; bi < rows; bi++) {
-+					if (regmap[(by + bi) * w + x] == reg)
++					if (regmap[(size_t)(by + bi) * w + x] == reg)
 +						bits |= (u_char)(1u << bi);
 +				}
 +				row[x] = (u_char)(63 + bits);
@@ -1486,18 +1484,12 @@ diff --git a/tty.c b/tty.c
  	int			 fallback;
  
  	fallback = 0;
-+	log_debug("%s: TERM_SIXEL=%d TTYC_SXL=%d xpixel=%u ypixel=%u",
-+	    __func__,
-+	    !!(tty->term->flags & TERM_SIXEL),
-+	    tty_term_has(tty->term, TTYC_SXL),
-+	    tty->xpixel, tty->ypixel);
  	if ((~tty->term->flags & TERM_SIXEL) &&
  	    !tty_term_has(tty->term, TTYC_SXL))
  		fallback = 1;
  	if (tty->xpixel == 0 || tty->ypixel == 0)
  		fallback = 1;
-+	log_debug("%s: fallback=%d", __func__, fallback);
- 
+
  	sixel_size_in_cells(si, &sx, &sy);
  	log_debug("%s: image is %ux%u", __func__, sx, sy);
 @@ -2393,7 +2399,32 @@
