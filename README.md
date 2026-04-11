@@ -48,6 +48,6 @@ See [`tools/README.md`](tools/README.md) for:
 
 - tmux built from source with sixel support (`--enable-sixel`)
 - giflib 5.x (`brew install giflib` or `apt install libgif-dev`) for `animate`
-- Python 3 + Pillow (`pip install Pillow`) for PNG transparency (`set` with `.png`)
-- A terminal with sixel support (WezTerm, xterm, mlterm, etc.)
+- libpng (`brew install libpng` or `apt install libpng-dev`) for `set` with `.png`
+- A terminal with sixel support (Windows Terminal, WezTerm, xterm, mlterm, etc.)
 - `set -ga terminal-features '*:sync'` in `~/.tmux.conf`
