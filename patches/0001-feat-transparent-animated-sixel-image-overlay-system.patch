@@ -52,7 +52,7 @@ diff --git a/cmd-overlay-image.c b/cmd-overlay-image.c
 new file mode 100644
 --- a/cmd-overlay-image.c
 +++ b/cmd-overlay-image.c
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,303 @@
 +/* $OpenBSD$ */
 +
 +/*
@@ -251,7 +251,9 @@ new file mode 100644
 +				ph = (hopt != NULL) ? (u_int)hrows * cell_py : 0;
 +			}
 +			si = image_load_png(xpath, pw, ph,
-+			    tc->tty.xpixel, tc->tty.ypixel, &pngerr);
++			    tc->tty.xpixel > 0 ? tc->tty.xpixel : 8,
++			    tc->tty.ypixel > 0 ? tc->tty.ypixel : 16,
++			    &pngerr);
 +			if (si == NULL) {
 +				cmdq_error(item, "%s: %s", xpath,
 +				    pngerr != NULL ? pngerr : "failed to load PNG");
@@ -341,7 +343,9 @@ new file mode 100644
 +		    (unsigned char)start[slen - 1] == 0x5c)
 +			slen -= 2;
 +
-+		si = sixel_parse(start, slen, file_p2, tc->tty.xpixel, tc->tty.ypixel);
++		si = sixel_parse(start, slen, file_p2,
++		    tc->tty.xpixel > 0 ? tc->tty.xpixel : 8,
++		    tc->tty.ypixel > 0 ? tc->tty.ypixel : 16);
 +	}
 +	free(buf);
 +	if (si == NULL) {
@@ -1424,15 +1428,7 @@ new file mode 100644
 diff --git a/tmux.h b/tmux.h
 --- a/tmux.h
 +++ b/tmux.h
-@@ -2187,6 +2187,7 @@
- 	void			*overlay_data;
- 	struct event		 overlay_timer;
- 
-+	struct image_overlay	*image_overlay;
- 
- 	struct client_files	 files;
- 	u_int			 source_file_depth;
-@@ -2688,6 +2689,8 @@
+@@ -2689,6 +2689,8 @@
  
  #ifdef ENABLE_SIXEL
  void	tty_draw_images(struct client *, struct window_pane *, struct screen *);
@@ -1441,7 +1437,7 @@ diff --git a/tmux.h b/tmux.h
  #endif
  
  void	tty_sync_start(struct tty *);
-@@ -3067,6 +3070,32 @@
+@@ -3068,6 +3070,32 @@
  void	 server_client_remove_pane(struct window_pane *);
  void	 server_client_print(struct client *, int, struct evbuffer *);
  
