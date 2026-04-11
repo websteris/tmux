@@ -1,0 +1,1403 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Webster Olson <webster@webster.is>
+Date: Thu, 10 Apr 2026 21:39:04 -0600
+Subject: [PATCH] feat: transparent animated sixel image overlay system
+
+Adds overlay-image command for rendering transparent images as overlays
+on the terminal, outside any pane, with live content showing through.
+
+New files:
+- cmd-overlay-image.c: 'overlay-image set X Y FILE [-W cols] [-H rows]',
+  'overlay-image animate X Y FILE [-W cols] [-H rows]', and
+  'overlay-image clear'.  PNG handled via png_to_sixel.py; animated GIF
+  decoded natively via giflib with per-frame durations.
+- image-overlay.c: image_overlay_set/clear/draw/animate.  Animation uses
+  libevent timers with per-frame durations from the file metadata.
+- image-gif.c: load animated GIF using giflib; composites frames onto an
+  RGBA canvas (respecting disposal methods) and encodes via sixel-enc.c.
+- sixel-enc.c: RGBA-to-sixel encoder.  Palette deduplication, up to 255
+  color registers, RLE output, P2=1 (transparent background).
+
+Modified files:
+- tmux.h: struct client image_overlay field; function declarations
+- cmd.c: register cmd_overlay_image_entry
+- Makefile.am: add new source files; HAVE_GIFLIB conditional block
+- configure.ac: detect giflib (optional; enables animate)
+- screen-redraw.c: call image_overlay_draw in screen_redraw_pane for
+  flicker-free redraws during incremental pane updates (typing/output)
+- tty.c: tty_draw_overlay_image with conditional sync (avoids ending
+  outer sync block prematurely)
+- screen-write.c / input.c: sixel plumbing
+---
+diff --git a/Makefile.am b/Makefile.am
+--- a/Makefile.am	2026-04-10 22:22:29.887163248 -0600
++++ b/Makefile.am	2026-04-10 22:22:24.699569784 -0600
+@@ -114,6 +114,7 @@
+ 	cmd-load-buffer.c \
+ 	cmd-lock-server.c \
+ 	cmd-minimise-pane.c \
++	cmd-overlay-image.c \
+ 	cmd-move-window.c \
+ 	cmd-new-pane.c \
+ 	cmd-new-session.c \
+@@ -165,6 +166,7 @@
+ 	grid-view.c \
+ 	grid.c \
+ 	hyperlinks.c \
++	image-overlay.c \
+ 	input-keys.c \
+ 	input.c \
+ 	job.c \
+diff --git a/tmp/tmux_pgen/b/cmd-overlay-image.c b/tmp/tmux_pgen/b/cmd-overlay-image.c
+new file mode 100644
+index 0000000..20733bc
+--- /dev/null
++++ b/tmp/tmux_pgen/b/cmd-overlay-image.c
+@@ -0,0 +1,325 @@
++/* $OpenBSD$ */
++
++/*
++ * Copyright (c) 2024 Thomas Adam <thomas@xteddy.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
++ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <sys/types.h>
++#include <sys/stat.h>
++
++#include <errno.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#include "tmux.h"
++
++/*
++ * Set or clear a sixel image overlay on the client terminal.
++ * Usage: overlay-image set X Y FILE
++ *        overlay-image clear
++ */
++
++static enum cmd_retval	cmd_overlay_image_exec(struct cmd *, struct cmdq_item *);
++
++const struct cmd_entry cmd_overlay_image_entry = {
++	.name = "overlay-image",
++	.alias = "overlayimage",
++
++	.args = { "t:W:H:", 1, 4, NULL },
++	.usage = "[-t target-client] [-W cols] [-H rows] set X Y FILE | animate X Y FILE | clear",
++
++	.flags = CMD_AFTERHOOK|CMD_CLIENT_TFLAG,
++	.exec = cmd_overlay_image_exec
++};
++
++static enum cmd_retval
++cmd_overlay_image_exec(struct cmd *self, struct cmdq_item *item)
++{
++	struct args		*args = cmd_get_args(self);
++	struct client		*tc = cmdq_get_target_client(item);
++	const char		*subcmd, *xpath, *errstr;
++	const char		*wopt, *hopt;
++	char			*buf, *start, *end, *p;
++	FILE			*f;
++	struct stat		 st;
++	size_t			 len, slen;
++	struct sixel_image	*si;
++	long long		 x, y, wcols, hrows;
++	u_int			 cell_px, cell_py, pw, ph;
++
++	subcmd = args_string(args, 0);
++	if (subcmd == NULL) {
++		cmdq_error(item, "missing subcommand");
++		return (CMD_RETURN_ERROR);
++	}
++
++	if (strcmp(subcmd, "clear") == 0) {
++		image_overlay_clear(tc);
++		server_redraw_client(tc);
++		return (CMD_RETURN_NORMAL);
++	}
++
++	if (strcmp(subcmd, "animate") == 0) {
++#ifdef HAVE_GIFLIB
++		struct sixel_image	**aframes;
++		u_int			*adurations;
++		u_int			 anframes;
++		const char		*gerr;
++
++		if (args_count(args) < 4) {
++			cmdq_error(item, "usage: overlay-image animate X Y FILE");
++			return (CMD_RETURN_ERROR);
++		}
++
++		x = strtonum(args_string(args, 1), 0, UINT_MAX, &errstr);
++		if (errstr != NULL) {
++			cmdq_error(item, "X coordinate %s", errstr);
++			return (CMD_RETURN_ERROR);
++		}
++
++		y = strtonum(args_string(args, 2), 0, UINT_MAX, &errstr);
++		if (errstr != NULL) {
++			cmdq_error(item, "Y coordinate %s", errstr);
++			return (CMD_RETURN_ERROR);
++		}
++
++		xpath = args_string(args, 3);
++
++		wopt = args_get(args, 'W');
++		hopt = args_get(args, 'H');
++		pw = 0;
++		ph = 0;
++		if (wopt != NULL || hopt != NULL) {
++			cell_px = (tc->tty.xpixel > 0) ? tc->tty.xpixel : 8;
++			cell_py = (tc->tty.ypixel > 0) ? tc->tty.ypixel : 16;
++			wcols = (wopt != NULL)
++			    ? strtonum(wopt, 1, 10000, &errstr) : 0;
++			if (errstr != NULL) {
++				cmdq_error(item, "-W %s", errstr);
++				return (CMD_RETURN_ERROR);
++			}
++			hrows = (hopt != NULL)
++			    ? strtonum(hopt, 1, 10000, &errstr) : 0;
++			if (errstr != NULL) {
++				cmdq_error(item, "-H %s", errstr);
++				return (CMD_RETURN_ERROR);
++			}
++			pw = (wopt != NULL) ? (u_int)wcols * cell_px : 0;
++			ph = (hopt != NULL) ? (u_int)hrows * cell_py : 0;
++		}
++
++		anframes = image_load_gif(xpath, pw, ph,
++		    tc->tty.xpixel, tc->tty.ypixel,
++		    &aframes, &adurations, &gerr);
++		if (anframes == 0) {
++			cmdq_error(item, "%s: %s", xpath,
++			    gerr != NULL ? gerr : "failed to load");
++			return (CMD_RETURN_ERROR);
++		}
++
++		image_overlay_animate(tc, aframes, adurations, anframes,
++		    (u_int)x, (u_int)y);
++		return (CMD_RETURN_NORMAL);
++#else
++		cmdq_error(item, "overlay-image animate requires giflib "
++		    "(rebuild tmux with giflib installed)");
++		return (CMD_RETURN_ERROR);
++#endif
++	}
++
++	if (strcmp(subcmd, "set") != 0) {
++		cmdq_error(item, "unknown subcommand: %s", subcmd);
++		return (CMD_RETURN_ERROR);
++	}
++
++	if (args_count(args) < 4) {
++		cmdq_error(item, "usage: overlay-image set X Y FILE");
++		return (CMD_RETURN_ERROR);
++	}
++
++	x = strtonum(args_string(args, 1), 0, UINT_MAX, &errstr);
++	if (errstr != NULL) {
++		cmdq_error(item, "X coordinate %s", errstr);
++		return (CMD_RETURN_ERROR);
++	}
++
++	y = strtonum(args_string(args, 2), 0, UINT_MAX, &errstr);
++	if (errstr != NULL) {
++		cmdq_error(item, "Y coordinate %s", errstr);
++		return (CMD_RETURN_ERROR);
++	}
++
++	xpath = args_string(args, 3);
++
++	/* Check for PNG by extension and use python encoder for transparency. */
++	{
++		const char	*ext = strrchr(xpath, '.');
++		if (ext != NULL && strcasecmp(ext, ".png") == 0) {
++			char	 cmd[PATH_MAX + 128];
++			FILE	*pp;
++			char	*tmp;
++			size_t	 cap, nread;
++
++			wopt = args_get(args, 'W');
++			hopt = args_get(args, 'H');
++			if (wopt != NULL || hopt != NULL) {
++				cell_px = (tc->tty.xpixel > 0) ? tc->tty.xpixel : 8;
++				cell_py = (tc->tty.ypixel > 0) ? tc->tty.ypixel : 16;
++				wcols = (wopt != NULL)
++				    ? strtonum(wopt, 1, 10000, &errstr) : 0;
++				if (errstr != NULL) {
++					cmdq_error(item, "-W %s", errstr);
++					return (CMD_RETURN_ERROR);
++				}
++				hrows = (hopt != NULL)
++				    ? strtonum(hopt, 1, 10000, &errstr) : 0;
++				if (errstr != NULL) {
++					cmdq_error(item, "-H %s", errstr);
++					return (CMD_RETURN_ERROR);
++				}
++				pw = (wopt != NULL) ? (u_int)wcols * cell_px : 0;
++				ph = (hopt != NULL) ? (u_int)hrows * cell_py : 0;
++				if (pw > 0 && ph > 0) {
++					snprintf(cmd, sizeof cmd,
++					    "python3 /home/web0/.claude/hooks/png_to_sixel.py '%s' --width %u --height %u",
++					    xpath, pw, ph);
++				} else if (pw > 0) {
++					snprintf(cmd, sizeof cmd,
++					    "python3 /home/web0/.claude/hooks/png_to_sixel.py '%s' --width %u",
++					    xpath, pw);
++				} else {
++					snprintf(cmd, sizeof cmd,
++					    "python3 /home/web0/.claude/hooks/png_to_sixel.py '%s' --height %u",
++					    xpath, ph);
++				}
++			} else {
++				snprintf(cmd, sizeof cmd,
++				    "python3 /home/web0/.claude/hooks/png_to_sixel.py '%s'",
++				    xpath);
++			}
++			pp = popen(cmd, "r");
++			if (pp == NULL) {
++				cmdq_error(item, "%s: popen failed: %s",
++				    xpath, strerror(errno));
++				return (CMD_RETURN_ERROR);
++			}
++
++			cap = 65536;
++			buf = xmalloc(cap);
++			len = 0;
++			for (;;) {
++				if (len + 4096 > cap) {
++					cap *= 2;
++					tmp = xrealloc(buf, cap);
++					buf = tmp;
++				}
++				nread = fread(buf + len, 1, 4096, pp);
++				if (nread == 0)
++					break;
++				len += nread;
++			}
++			pclose(pp);
++
++			if (len == 0) {
++				cmdq_error(item, "%s: png encoder produced no output",
++				    xpath);
++				free(buf);
++				return (CMD_RETURN_ERROR);
++			}
++		} else {
++			if (stat(xpath, &st) != 0) {
++				cmdq_error(item, "%s: %s", xpath, strerror(errno));
++				return (CMD_RETURN_ERROR);
++			}
++			len = (size_t)st.st_size;
++			if (len == 0) {
++				cmdq_error(item, "%s: empty file", xpath);
++				return (CMD_RETURN_ERROR);
++			}
++
++			f = fopen(xpath, "rb");
++			if (f == NULL) {
++				cmdq_error(item, "%s: %s", xpath, strerror(errno));
++				return (CMD_RETURN_ERROR);
++			}
++
++			buf = xmalloc(len);
++			if (fread(buf, 1, len, f) != len) {
++				cmdq_error(item, "%s: read error", xpath);
++				free(buf);
++				fclose(f);
++				return (CMD_RETURN_ERROR);
++			}
++			fclose(f);
++		}
++	}
++
++	/*
++	 * sixel_parse expects the buffer to start with 'q' (the DCS final
++	 * byte).  Strip the leading ESC P ... prefix if present, extract the
++	 * P2 parameter (transparency mode), and strip the trailing ESC \.
++	 *
++	 * DCS format: ESC P <P1>;<P2>;<P3> q ...
++	 * P2=0 or P2=1: background filled; P2=2: background transparent.
++	 */
++	{
++		u_int	 file_p2 = 0;
++
++		start = buf;
++		end = buf + len;
++		if (len >= 2 && (unsigned char)buf[0] == 0x1b && buf[1] == 'P') {
++			/* Parse P1;P2;P3 params between ESC P and 'q'. */
++			p = buf + 2;
++			{
++				int	 field = 0;
++				long	 val = 0;
++				while (p < end && *p != 'q') {
++					if (*p >= '0' && *p <= '9') {
++						val = val * 10 + (*p - '0');
++					} else if (*p == ';') {
++						if (field == 1)
++							file_p2 = (u_int)val;
++						field++;
++						val = 0;
++					}
++					p++;
++				}
++				if (field == 1)
++					file_p2 = (u_int)val;
++			}
++			if (p < end)
++				start = p;   /* points at 'q' */
++		}
++		/* Strip trailing ESC \ (0x1b 0x5c) or ST if present. */
++		slen = (size_t)(end - start);
++		if (slen >= 2 &&
++		    (unsigned char)start[slen - 2] == 0x1b &&
++		    (unsigned char)start[slen - 1] == 0x5c)
++			slen -= 2;
++
++		si = sixel_parse(start, slen, file_p2, tc->tty.xpixel, tc->tty.ypixel);
++	}
++	free(buf);
++	if (si == NULL) {
++		cmdq_error(item, "%s: failed to parse sixel image", xpath);
++		return (CMD_RETURN_ERROR);
++	}
++
++	image_overlay_set(tc, si, (u_int)x, (u_int)y);
++	return (CMD_RETURN_NORMAL);
++}
+diff --git a/cmd.c b/cmd.c
+--- a/cmd.c	2026-04-10 22:22:29.887163248 -0600
++++ b/cmd.c	2026-04-10 22:22:24.707610162 -0600
+@@ -71,6 +71,7 @@
+ extern const struct cmd_entry cmd_lock_session_entry;
+ extern const struct cmd_entry cmd_float_pane_entry;
+ extern const struct cmd_entry cmd_minimise_pane_entry;
++extern const struct cmd_entry cmd_overlay_image_entry;
+ extern const struct cmd_entry cmd_move_pane_entry;
+ extern const struct cmd_entry cmd_move_window_entry;
+ extern const struct cmd_entry cmd_new_pane_entry;
+@@ -175,6 +176,7 @@
+ 	&cmd_new_window_entry,
+ 	&cmd_next_layout_entry,
+ 	&cmd_next_window_entry,
++	&cmd_overlay_image_entry,
+ 	&cmd_paste_buffer_entry,
+ 	&cmd_pipe_pane_entry,
+ 	&cmd_previous_layout_entry,
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac	2026-04-10 22:23:09.616281967 -0600
++++ b/configure.ac	2026-04-10 22:22:24.703589972 -0600
+@@ -471,6 +471,21 @@
+ fi
+ AM_CONDITIONAL(ENABLE_SIXEL, [test "x$enable_sixel" = xyes])
+ 
++# GIF support via giflib (optional; enables overlay-image animate).
++AC_CHECK_LIB(
++	[gif],
++	[DGifSlurp],
++	[found_giflib=yes],
++	[found_giflib=no]
++)
++if test "x$found_giflib" = xyes; then
++	AC_CHECK_HEADER([gif_lib.h], [], [found_giflib=no])
++fi
++if test "x$found_giflib" = xyes; then
++	AC_DEFINE(HAVE_GIFLIB, 1, [giflib is available])
++	LIBS="$LIBS -lgif"
++fi
++AM_CONDITIONAL(HAVE_GIFLIB, [test "x$found_giflib" = xyes])
+ 
+ # Check for b64_ntop. If we have b64_ntop, we assume b64_pton as well.
+ AC_MSG_CHECKING(for b64_ntop)
+diff --git a/tmp/tmux_pgen/b/image-gif.c b/tmp/tmux_pgen/b/image-gif.c
+new file mode 100644
+index 0000000..a384414
+--- /dev/null
++++ b/tmp/tmux_pgen/b/image-gif.c
+@@ -0,0 +1,230 @@
++/* $OpenBSD$ */
++
++/*
++ * Copyright (c) 2024 Thomas Adam <thomas@xteddy.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
++ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifdef HAVE_GIFLIB
++
++#include <sys/types.h>
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <gif_lib.h>
++
++#include "tmux.h"
++
++/*
++ * Load an animated (or static) GIF and return an array of sixel frames with
++ * per-frame durations in milliseconds.
++ *
++ * pw, ph:  target pixel dimensions; 0 means use the GIF's natural screen size.
++ * xpixel, ypixel: terminal cell pixel size, passed to sixel_parse.
++ *
++ * On success returns nframes > 0 and fills *framesp / *durationsp (both
++ * xcalloc'd; caller frees with sixel_free + free on the arrays).
++ * On error returns 0 and sets *errp to a static error string.
++ */
++
++/* Nearest-neighbor scale of an RGBA buffer from (sw x sh) to (dw x dh). */
++static u_char *
++rgba_scale(const u_char *src, u_int sw, u_int sh, u_int dw, u_int dh)
++{
++	u_char	*dst;
++	u_int	 x, y, sx, sy;
++
++	dst = xmalloc((size_t)dw * dh * 4);
++	for (y = 0; y < dh; y++) {
++		sy = y * sh / dh;
++		for (x = 0; x < dw; x++) {
++			sx = x * sw / dw;
++			memcpy(dst + (y * dw + x) * 4,
++			    src + (sy * sw + sx) * 4, 4);
++		}
++	}
++	return (dst);
++}
++
++/*
++ * Extract delay (centiseconds) and transparent color index from a frame's
++ * Graphic Control Extension block.  Sets defaults when no GCE is present.
++ */
++static void
++gif_gce(const SavedImage *img, int *delay_cs, int *trans_idx, int *disposal)
++{
++	int			 i;
++	const ExtensionBlock	*eb;
++
++	*delay_cs  = 10;	/* default: 100 ms */
++	*trans_idx = -1;
++	*disposal  = 0;
++
++	for (i = 0; i < img->ExtensionBlockCount; i++) {
++		eb = &img->ExtensionBlocks[i];
++		if (eb->Function == GRAPHICS_EXT_FUNC_CODE &&
++		    eb->ByteCount >= 4) {
++			*disposal  = ((unsigned char)eb->Bytes[0] >> 2) & 0x07;
++			*delay_cs  = (unsigned char)eb->Bytes[1] |
++			    ((unsigned char)eb->Bytes[2] << 8);
++			if (*delay_cs <= 0)
++				*delay_cs = 10;
++			if ((unsigned char)eb->Bytes[0] & 0x01)
++				*trans_idx = (unsigned char)eb->Bytes[3];
++			return;
++		}
++	}
++}
++
++/* Return the active color map for this frame (local preferred, else global). */
++static const ColorMapObject *
++gif_cmap(const GifFileType *gif, const SavedImage *img)
++{
++	if (img->ImageDesc.ColorMap != NULL)
++		return (img->ImageDesc.ColorMap);
++	return (gif->SColorMap);
++}
++
++u_int
++image_load_gif(const char *path, u_int pw, u_int ph,
++    u_int xpixel, u_int ypixel,
++    struct sixel_image ***framesp, u_int **durationsp, const char **errp)
++{
++	GifFileType		*gif;
++	int			 gerr;
++	u_int			 nframes, i;
++	struct sixel_image	**frames;
++	u_int			*durations;
++	u_char			*canvas;
++	u_int			 lw, lh;
++	const SavedImage	*img;
++	const ColorMapObject	*cmap;
++	const GifColorType	*colors;
++	int			 delay_cs, trans_idx, disposal;
++	u_int			 fx, fy, fw, fh, x, y;
++	u_char			*scaled;
++	struct sixel_image	*si;
++	GifByteType		 idx;
++	u_char			*cp;
++
++	*errp      = NULL;
++	*framesp   = NULL;
++	*durationsp = NULL;
++
++	gerr = 0;
++	gif  = DGifOpenFileName(path, &gerr);
++	if (gif == NULL) {
++		*errp = GifErrorString(gerr);
++		return (0);
++	}
++	if (DGifSlurp(gif) != GIF_OK) {
++		*errp = GifErrorString(gif->Error);
++		DGifCloseFile(gif, &gerr);
++		return (0);
++	}
++	if (gif->ImageCount <= 0) {
++		*errp = "no frames";
++		DGifCloseFile(gif, &gerr);
++		return (0);
++	}
++
++	lw = (u_int)gif->SWidth;
++	lh = (u_int)gif->SHeight;
++	if (lw == 0 || lh == 0) {
++		*errp = "zero-size GIF";
++		DGifCloseFile(gif, &gerr);
++		return (0);
++	}
++
++	nframes   = (u_int)gif->ImageCount;
++	frames    = xcalloc(nframes, sizeof *frames);
++	durations = xcalloc(nframes, sizeof *durations);
++	canvas    = xcalloc((size_t)lw * lh, 4);	/* RGBA, starts transparent */
++
++	for (i = 0; i < nframes; i++) {
++		img  = &gif->SavedImages[i];
++		cmap = gif_cmap(gif, img);
++
++		gif_gce(img, &delay_cs, &trans_idx, &disposal);
++		durations[i] = (u_int)delay_cs * 10;	/* centiseconds → ms */
++
++		fx = (u_int)img->ImageDesc.Left;
++		fy = (u_int)img->ImageDesc.Top;
++		fw = (u_int)img->ImageDesc.Width;
++		fh = (u_int)img->ImageDesc.Height;
++
++		/* Blit this frame onto the canvas. */
++		if (cmap != NULL) {
++			colors = cmap->Colors;
++			for (y = 0; y < fh && fy + y < lh; y++) {
++				for (x = 0; x < fw && fx + x < lw; x++) {
++					idx = img->RasterBits[y * fw + x];
++					if ((int)idx == trans_idx)
++						continue;	/* keep canvas pixel */
++					cp    = canvas + ((fy + y) * lw + (fx + x)) * 4;
++					cp[0] = colors[idx].Red;
++					cp[1] = colors[idx].Green;
++					cp[2] = colors[idx].Blue;
++					cp[3] = 255;
++				}
++			}
++		}
++
++		/* Encode the composited canvas (optionally scaled). */
++		if (pw > 0 && ph > 0 && (pw != lw || ph != lh)) {
++			scaled = rgba_scale(canvas, lw, lh, pw, ph);
++			si     = sixel_from_rgba(scaled, pw, ph, xpixel, ypixel);
++			free(scaled);
++		} else
++			si = sixel_from_rgba(canvas, lw, lh, xpixel, ypixel);
++
++		if (si == NULL) {
++			*errp = "sixel encode failed";
++			while (i > 0)
++				sixel_free(frames[--i]);
++			free(frames);
++			free(durations);
++			free(canvas);
++			DGifCloseFile(gif, &gerr);
++			return (0);
++		}
++		frames[i] = si;
++
++		/*
++		 * Apply this frame's disposal method to prepare the canvas for
++		 * the next frame.
++		 *   0, 1 — keep canvas as-is
++		 *   2    — restore frame region to transparent
++		 *   3    — restore to previous (treat as 2 for simplicity)
++		 */
++		if (disposal >= 2) {
++			for (y = 0; y < fh && fy + y < lh; y++) {
++				for (x = 0; x < fw && fx + x < lw; x++) {
++					cp    = canvas + ((fy + y) * lw + (fx + x)) * 4;
++					cp[0] = cp[1] = cp[2] = cp[3] = 0;
++				}
++			}
++		}
++	}
++
++	free(canvas);
++	DGifCloseFile(gif, &gerr);
++
++	*framesp    = frames;
++	*durationsp = durations;
++	return (nframes);
++}
++
++#endif /* HAVE_GIFLIB */
+diff --git a/tmp/tmux_pgen/b/image-overlay.c b/tmp/tmux_pgen/b/image-overlay.c
+new file mode 100644
+index 0000000..766ba56
+--- /dev/null
++++ b/tmp/tmux_pgen/b/image-overlay.c
+@@ -0,0 +1,178 @@
++/* $OpenBSD$ */
++
++/*
++ * Copyright (c) 2024 Thomas Adam <thomas@xteddy.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
++ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <sys/types.h>
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "tmux.h"
++
++struct image_overlay {
++	struct sixel_image	*si;		/* current frame */
++	u_int			 x;
++	u_int			 y;
++	u_int			 sx;
++	u_int			 sy;
++
++	/* Animation (nframes > 0 when animating) */
++	struct sixel_image	**frames;
++	u_int			 *durations;	/* ms per frame */
++	u_int			  nframes;
++	u_int			  frame;
++	struct event		  timer;
++	struct client		 *c;
++};
++
++void
++image_overlay_set(struct client *c, struct sixel_image *si, u_int x, u_int y)
++{
++	struct image_overlay	*io;
++
++	image_overlay_clear(c);
++	io = xcalloc(1, sizeof *io);
++	io->si = si;
++	io->x = x;
++	io->y = y;
++	sixel_size_in_cells(si, &io->sx, &io->sy);
++	c->image_overlay = io;
++	server_redraw_client(c);
++}
++
++void
++image_overlay_clear(struct client *c)
++{
++	struct image_overlay	*io = c->image_overlay;
++	u_int			 i;
++
++	if (io == NULL)
++		return;
++	if (io->nframes > 0) {
++		evtimer_del(&io->timer);
++		for (i = 0; i < io->nframes; i++)
++			sixel_free(io->frames[i]);
++		free(io->frames);
++		free(io->durations);
++	} else {
++		sixel_free(io->si);
++	}
++	free(io);
++	c->image_overlay = NULL;
++}
++
++static void
++image_overlay_timer_cb(__unused int fd, __unused short events, void *data)
++{
++	struct image_overlay	*io = data;
++	struct timeval		 tv;
++
++	io->frame = (io->frame + 1) % io->nframes;
++	io->si = io->frames[io->frame];
++	sixel_size_in_cells(io->si, &io->sx, &io->sy);
++	server_redraw_client(io->c);
++	tv.tv_sec  = io->durations[io->frame] / 1000;
++	tv.tv_usec = (io->durations[io->frame] % 1000) * 1000;
++	evtimer_add(&io->timer, &tv);
++}
++
++void
++image_overlay_animate(struct client *c, struct sixel_image **frames,
++    u_int *durations, u_int nframes, u_int x, u_int y)
++{
++	struct image_overlay	*io;
++	struct timeval		 tv;
++
++	image_overlay_clear(c);
++	io = xcalloc(1, sizeof *io);
++	io->frames = frames;
++	io->durations = durations;
++	io->nframes = nframes;
++	io->frame = 0;
++	io->si = frames[0];
++	io->x = x;
++	io->y = y;
++	sixel_size_in_cells(io->si, &io->sx, &io->sy);
++	io->c = c;
++	tv.tv_sec  = durations[0] / 1000;
++	tv.tv_usec = (durations[0] % 1000) * 1000;
++	evtimer_set(&io->timer, image_overlay_timer_cb, io);
++	evtimer_add(&io->timer, &tv);
++	c->image_overlay = io;
++	server_redraw_client(c);
++}
++
++void
++image_overlay_draw(struct client *c)
++{
++	struct image_overlay	*io = c->image_overlay;
++
++	if (io == NULL)
++		return;
++	tty_draw_overlay_image(&c->tty, io->si, io->x, io->y, io->sx, io->sy);
++}
++
++/*
++ * Remove cells covered by the image overlay from a visible_ranges set for
++ * screen row py.  Called from screen_redraw_draw_pane so that we never send
++ * blank cells over the overlay area, eliminating the clear-then-repaint flash.
++ */
++void
++image_overlay_clip_ranges(struct client *c, struct visible_ranges *r, u_int py)
++{
++	struct image_overlay	*io = c->image_overlay;
++	u_int			 i, n, clip_x, clip_end, rx, rend;
++	struct visible_range	*ri;
++
++	if (io == NULL)
++		return;
++	if (py < io->y || py >= io->y + io->sy)
++		return;
++
++	clip_x   = io->x;
++	clip_end = io->x + io->sx;
++	n = r->used;
++
++	for (i = 0; i < n; i++) {
++		ri   = &r->ranges[i];
++		rx   = ri->px;
++		rend = ri->px + ri->nx;
++
++		if (ri->nx == 0 || rend <= clip_x || rx >= clip_end)
++			continue;
++
++		if (rx >= clip_x && rend <= clip_end) {
++			/* Fully inside overlay: hide. */
++			ri->nx = 0;
++		} else if (rx < clip_x && rend > clip_end) {
++			/* Spans across overlay: split into left + right. */
++			server_client_ensure_ranges(r, r->used + 1);
++			ri = &r->ranges[i];	/* re-read after possible realloc */
++			r->ranges[r->used].px = clip_end;
++			r->ranges[r->used].nx = rend - clip_end;
++			r->used++;
++			ri->nx = clip_x - rx;
++		} else if (rx < clip_x) {
++			/* Overlaps right edge of range: truncate. */
++			ri->nx = clip_x - rx;
++		} else {
++			/* Starts inside overlay, ends outside: shift right. */
++			ri->px = clip_end;
++			ri->nx = rend - clip_end;
++		}
++	}
++}
+diff --git a/input.c b/input.c
+--- a/input.c	2026-04-10 22:22:29.887163248 -0600
++++ b/input.c	2026-04-10 22:22:24.707610162 -0600
+@@ -2573,14 +2573,20 @@
+ 	}
+ 
+ #ifdef ENABLE_SIXEL
++	log_debug("%s: buf len=%zu buf[0]=%02x wp=%s", __func__, len,
++	    len > 0 ? (unsigned char)buf[0] : 0, wp != NULL ? "set" : "NULL");
+ 	if (wp != NULL && buf[0] == 'q' && ictx->interm_len == 0) {
+ 		w = wp->window;
++		log_debug("%s: entering sixel parse, w->xpixel=%u w->ypixel=%u",
++		    __func__, w->xpixel, w->ypixel);
+ 		if (input_split(ictx) != 0)
+ 			return (0);
+ 		p2 = input_get(ictx, 1, 0, 0);
+ 		if (p2 == -1)
+ 			p2 = 0;
+ 		si = sixel_parse(buf, len, p2, w->xpixel, w->ypixel);
++		log_debug("%s: sixel_parse returned %s", __func__,
++		    si != NULL ? "image" : "NULL");
+ 		if (si != NULL)
+ 			screen_write_sixelimage(sctx, si, ictx->cell.cell.bg);
+ 	}
+diff --git a/screen-redraw.c b/screen-redraw.c
+--- a/screen-redraw.c	2026-04-10 22:22:29.887163248 -0600
++++ b/screen-redraw.c	2026-04-10 22:22:24.711630352 -0600
+@@ -862,6 +862,9 @@
+ 		c->overlay_draw(c, c->overlay_data, &ctx);
+ 	}
+ 
++	if (c->image_overlay != NULL)
++		image_overlay_draw(c);
++
+ 	tty_reset(&c->tty);
+ }
+ 
+@@ -885,6 +888,11 @@
+ 	if (window_pane_show_scrollbar(wp, ctx.pane_scrollbars))
+ 		screen_redraw_draw_pane_scrollbar(&ctx, wp);
+ 
++#ifdef ENABLE_SIXEL
++	if (c->image_overlay != NULL)
++		image_overlay_draw(c);
++#endif
++
+ 	tty_reset(&c->tty);
+ }
+ 
+@@ -1321,6 +1329,13 @@
+ 	else
+ 		woy = 0;
+ 
++#ifdef ENABLE_SIXEL
++	/* Wrap the text-cell pass AND sixel draw in one synchronized update
++	 * so WezTerm never sees blank cells without the image on top. */
++	int pane_sync = !TAILQ_EMPTY(&s->images) && !(tty->flags & TTY_SYNCING);
++	if (pane_sync)
++		tty_sync_start(tty);
++#endif
+ 	for (j = 0; j < wp->sy; j++) {
+ 		if (wp->yoff + (int)j < (int)ctx->oy ||
+ 		    wp->yoff + (int)j >= (int)ctx->oy + (int)ctx->sy)
+@@ -1377,6 +1392,8 @@
+ 
+ #ifdef ENABLE_SIXEL
+ 	tty_draw_images(c, wp, s);
++	if (pane_sync)
++		tty_sync_end(tty);
+ #endif
+ }
+ 
+diff --git a/screen-write.c b/screen-write.c
+--- a/screen-write.c	2026-04-10 22:22:29.887163248 -0600
++++ b/screen-write.c	2026-04-10 22:22:24.715650540 -0600
+@@ -135,27 +135,27 @@
+ 	struct window_pane	*wp = ttyctx->arg;
+ 
+ 	if (ttyctx->allow_invisible_panes) {
+-		if (session_has(c->session, wp->window))
+-			return (1);
+-		return (0);
+-	}
+-
+-	if (c->session->curw->window != wp->window)
+-		return (0);
+-	if (wp->layout_cell == NULL)
+-		return (0);
++		if (!session_has(c->session, wp->window))
++			return (0);
++		/* Fall through to set client-specific geometry fields. */
++	} else {
++		if (c->session->curw->window != wp->window)
++			return (0);
++		if (wp->layout_cell == NULL && !(wp->flags & PANE_FLOATING))
++			return (0);
+ 
+-	if (wp->flags & (PANE_REDRAW|PANE_DROP))
+-		return (-1);
+-	if (c->flags & CLIENT_REDRAWPANES) {
+-		/*
+-		 * Redraw is already deferred to redraw another pane - redraw
+-		 * this one also when that happens.
+-		 */
+-		log_debug("%s: adding %%%u to deferred redraw", __func__,
+-		    wp->id);
+-		wp->flags |= (PANE_REDRAW|PANE_REDRAWSCROLLBAR);
+-		return (-1);
++		if (wp->flags & (PANE_REDRAW|PANE_DROP))
++			return (-1);
++		if (c->flags & CLIENT_REDRAWPANES) {
++			/*
++			 * Redraw is already deferred to redraw another pane -
++			 * redraw this one also when that happens.
++			 */
++			log_debug("%s: adding %%%u to deferred redraw",
++			    __func__, wp->id);
++			wp->flags |= (PANE_REDRAW|PANE_REDRAWSCROLLBAR);
++			return (-1);
++		}
+ 	}
+ 
+ 	ttyctx->bigger = tty_window_offset(&c->tty, &ttyctx->wox, &ttyctx->woy,
+@@ -2781,6 +2781,7 @@
+ 	screen_write_collect_flush(ctx, 0, __func__);
+ 
+ 	screen_write_initctx(ctx, &ttyctx, 0);
++	ttyctx.allow_invisible_panes = 1;
+ 	ttyctx.ptr = image_store(s, si);
+ 
+ 	tty_write(tty_cmd_sixelimage, &ttyctx);
+diff --git a/tmp/tmux_pgen/b/sixel-enc.c b/tmp/tmux_pgen/b/sixel-enc.c
+new file mode 100644
+index 0000000..f2aba6b
+--- /dev/null
++++ b/tmp/tmux_pgen/b/sixel-enc.c
+@@ -0,0 +1,311 @@
++/* $OpenBSD$ */
++
++/*
++ * Copyright (c) 2024 Thomas Adam <thomas@xteddy.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
++ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
++ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <sys/types.h>
++
++#include <limits.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "tmux.h"
++
++/*
++ * Encode an RGBA pixel buffer to a DCS-wrapped sixel byte stream.
++ *   rgba    row-major, 4 bytes per pixel: R, G, B, A
++ *   w, h    dimensions in pixels
++ *   *lenp   receives the byte count of the returned buffer
++ *
++ * Pixels with A < 128 are transparent (DCS P2=1).  Up to 255 unique opaque
++ * colors are assigned to sixel registers 1..N.  If more than 255 unique
++ * colors exist, extras are mapped to the nearest register (RGB L2 distance).
++ * Returns a malloc'd char buffer that the caller must free.
++ *
++ * sixel_from_rgba() is a convenience wrapper that also calls sixel_parse()
++ * and returns a struct sixel_image *.
++ */
++
++#define MAX_REG    255
++#define PHASH_SZ   4096u
++#define PHASH_MK   (PHASH_SZ - 1u)
++
++struct phash_slot {
++	u_int	key;	/* 0x00RRGGBB; meaningful only when reg != 0 */
++	u_char	reg;	/* 1-based sixel register; 0 = empty slot */
++};
++
++static u_char
++phash_get(const struct phash_slot *ht, u_int key)
++{
++	u_int h;
++
++	h = (key ^ (key >> 12)) & PHASH_MK;
++	while (ht[h].reg != 0) {
++		if (ht[h].key == key)
++			return (ht[h].reg);
++		h = (h + 1) & PHASH_MK;
++	}
++	return (0);
++}
++
++static void
++phash_put(struct phash_slot *ht, u_int key, u_char reg)
++{
++	u_int h;
++
++	h = (key ^ (key >> 12)) & PHASH_MK;
++	while (ht[h].reg != 0)
++		h = (h + 1) & PHASH_MK;
++	ht[h].key = key;
++	ht[h].reg = reg;
++}
++
++static u_char
++nearest_reg(const u_char *pr, const u_char *pg, const u_char *pb,
++    int n, u_char r, u_char g, u_char b)
++{
++	int	i, best, bdist, d, dr, dg, db;
++
++	best  = 0;
++	bdist = INT_MAX;
++	for (i = 0; i < n; i++) {
++		dr = (int)pr[i] - (int)r;
++		dg = (int)pg[i] - (int)g;
++		db = (int)pb[i] - (int)b;
++		d  = dr * dr + dg * dg + db * db;
++		if (d < bdist) {
++			bdist = d;
++			best  = i;
++		}
++	}
++	return ((u_char)(best + 1));
++}
++
++/* Growing output buffer. */
++struct sbuf {
++	char	*data;
++	size_t	 len;
++	size_t	 cap;
++};
++
++static void
++sbuf_grow(struct sbuf *sb, size_t n)
++{
++	while (sb->len + n > sb->cap) {
++		sb->cap *= 2;
++		sb->data = xrealloc(sb->data, sb->cap);
++	}
++}
++
++static void
++sbuf_bytes(struct sbuf *sb, const void *p, size_t n)
++{
++	sbuf_grow(sb, n);
++	memcpy(sb->data + sb->len, p, n);
++	sb->len += n;
++}
++
++static void
++sbuf_str(struct sbuf *sb, const char *s)
++{
++	sbuf_bytes(sb, s, strlen(s));
++}
++
++static void
++sbuf_byte(struct sbuf *sb, u_char c)
++{
++	sbuf_grow(sb, 1);
++	sb->data[sb->len++] = (char)c;
++}
++
++static void
++sbuf_fmt(struct sbuf *sb, const char *fmt, ...)
++{
++	char	 tmp[64];
++	va_list	 ap;
++
++	va_start(ap, fmt);
++	vsnprintf(tmp, sizeof tmp, fmt, ap);
++	va_end(ap);
++	sbuf_str(sb, tmp);
++}
++
++char *
++sixel_encode_rgba(const u_char *rgba, u_int w, u_int h, size_t *lenp)
++{
++	struct phash_slot	*ht;
++	u_char			 palr[MAX_REG], palg[MAX_REG], palb[MAX_REG];
++	u_char			*regmap;
++	int			 ncolors;
++	u_int			 x, y, band, bi, by, rows, ci, cnt;
++	struct sbuf		 sb;
++	u_char			*row;
++	const u_char		*p;
++	u_char			 r, g, b, a, reg, ch, bits;
++	u_int			 key;
++	int			 i, r100, g100, b100, first, has_any;
++	char			 tmp[32];
++	u_int			 j;
++
++	ht      = xcalloc(PHASH_SZ, sizeof *ht);
++	regmap  = xmalloc((size_t)w * h);
++	ncolors = 0;
++
++	/* Pass 1: assign palette registers to unique opaque colors. */
++	for (y = 0; y < h; y++) {
++		for (x = 0; x < w; x++) {
++			p = rgba + (y * w + x) * 4;
++			a = p[3];
++			if (a < 128) {
++				regmap[y * w + x] = 0;
++				continue;
++			}
++			r   = p[0]; g = p[1]; b = p[2];
++			key = ((u_int)r << 16) | ((u_int)g << 8) | b;
++			reg = phash_get(ht, key);
++			if (reg == 0) {
++				if (ncolors < MAX_REG) {
++					ncolors++;
++					reg              = (u_char)ncolors;
++					palr[ncolors-1]  = r;
++					palg[ncolors-1]  = g;
++					palb[ncolors-1]  = b;
++					phash_put(ht, key, reg);
++				} else
++					reg = nearest_reg(palr, palg, palb,
++					    ncolors, r, g, b);
++			}
++			regmap[y * w + x] = reg;
++		}
++	}
++	free(ht);
++
++	/* Pass 2: build sixel stream. */
++	sb.cap  = 131072;
++	sb.len  = 0;
++	sb.data = xmalloc(sb.cap);
++
++	/* DCS header: P2=1 means unset pixels retain terminal background. */
++	sbuf_fmt(&sb, "\033P0;1;0q\"1;1;%u;%u", w, h);
++
++	/* Color register definitions: #N;2;r;g;b (values 0..100). */
++	for (i = 0; i < ncolors; i++) {
++		r100 = ((int)palr[i] * 100 + 127) / 255;
++		g100 = ((int)palg[i] * 100 + 127) / 255;
++		b100 = ((int)palb[i] * 100 + 127) / 255;
++		sbuf_fmt(&sb, "#%d;2;%d;%d;%d", i + 1, r100, g100, b100);
++	}
++
++	row = xmalloc(w);
++
++	/* One sixel band covers 6 pixel rows. */
++	for (band = 0; band * 6 < h; band++) {
++		by   = band * 6;
++		rows = h - by;
++		if (rows > 6)
++			rows = 6;
++		first = 1;
++
++		for (i = 0; i < ncolors; i++) {
++			reg     = (u_char)(i + 1);
++			has_any = 0;
++
++			for (x = 0; x < w; x++) {
++				bits = 0;
++				for (bi = 0; bi < rows; bi++) {
++					if (regmap[(by + bi) * w + x] == reg)
++						bits |= (u_char)(1u << bi);
++				}
++				row[x] = (u_char)(63 + bits);
++				if (bits)
++					has_any = 1;
++			}
++			if (!has_any)
++				continue;
++
++			if (!first)
++				sbuf_byte(&sb, '$');	/* CR: return to band start */
++			first = 0;
++
++			sbuf_fmt(&sb, "#%d", reg);
++
++			/* RLE: runs of 4+ characters become !N<char>. */
++			ci = 0;
++			while (ci < w) {
++				ch  = row[ci];
++				cnt = 1;
++				while (ci + cnt < w && row[ci + cnt] == ch)
++					cnt++;
++				if (cnt >= 4) {
++					snprintf(tmp, sizeof tmp, "!%u%c", cnt, (int)ch);
++					sbuf_str(&sb, tmp);
++				} else {
++					for (j = 0; j < cnt; j++)
++						sbuf_byte(&sb, ch);
++				}
++				ci += cnt;
++			}
++		}
++		if (by + 6 < h)
++			sbuf_byte(&sb, '-');	/* LF: advance to next band */
++	}
++
++	/* String terminator: ESC \ */
++	sbuf_byte(&sb, 0x1b);
++	sbuf_byte(&sb, '\\');
++
++	free(row);
++	free(regmap);
++	*lenp = sb.len;
++	return (sb.data);
++}
++
++struct sixel_image *
++sixel_from_rgba(const u_char *rgba, u_int w, u_int h, u_int xpixel, u_int ypixel)
++{
++	char		   *buf, *start;
++	size_t		    len, slen;
++	struct sixel_image *si;
++
++	buf   = sixel_encode_rgba(rgba, w, h, &len);
++	start = buf;
++	slen  = len;
++
++	/*
++	 * sixel_parse expects data starting at 'q' (the DCS final byte).
++	 * Strip the ESC P ... prefix if present.
++	 */
++	if (len >= 2 && (u_char)buf[0] == 0x1b && buf[1] == 'P') {
++		char *ep = buf + 2, *ee = buf + len;
++		while (ep < ee && *ep != 'q')
++			ep++;
++		if (ep < ee)
++			start = ep;
++		slen = (size_t)(buf + len - start);
++	}
++	/* Strip trailing ESC \ */
++	if (slen >= 2 &&
++	    (u_char)start[slen - 2] == 0x1b &&
++	    (u_char)start[slen - 1] == '\\')
++		slen -= 2;
++
++	si = sixel_parse(start, slen, 1, xpixel, ypixel);
++	free(buf);
++	return (si);
++}
+diff --git a/tmux.h b/tmux.h
+--- a/tmux.h	2026-04-10 22:23:09.616281967 -0600
++++ b/tmux.h	2026-04-10 22:22:24.703589972 -0600
+@@ -2187,6 +2187,8 @@
+ 	void			*overlay_data;
+ 	struct event		 overlay_timer;
+ 
++	struct image_overlay	*image_overlay;
++
+ 	struct client_files	 files;
+ 	u_int			 source_file_depth;
+ 
+@@ -2687,6 +2689,8 @@
+ 
+ #ifdef ENABLE_SIXEL
+ void	tty_draw_images(struct client *, struct window_pane *, struct screen *);
++void	tty_draw_overlay_image(struct tty *, struct sixel_image *, u_int, u_int,
++	    u_int, u_int);
+ #endif
+ 
+ void	tty_sync_start(struct tty *);
+@@ -3066,6 +3070,25 @@
+ void	 server_client_remove_pane(struct window_pane *);
+ void	 server_client_print(struct client *, int, struct evbuffer *);
+ 
++/* image-overlay.c */
++#ifdef ENABLE_SIXEL
++void	 image_overlay_set(struct client *, struct sixel_image *, u_int, u_int);
++void	 image_overlay_clear(struct client *);
++void	 image_overlay_draw(struct client *);
++void	 image_overlay_clip_ranges(struct client *, struct visible_ranges *, u_int);
++void	 image_overlay_animate(struct client *, struct sixel_image **, u_int *, u_int, u_int, u_int);
++#endif
++
++/* sixel-enc.c */
++#ifdef HAVE_GIFLIB
++char		*sixel_encode_rgba(const u_char *, u_int, u_int, size_t *);
++struct sixel_image *sixel_from_rgba(const u_char *, u_int, u_int, u_int, u_int);
++
++/* image-gif.c */
++u_int		 image_load_gif(const char *, u_int, u_int, u_int, u_int,
++		     struct sixel_image ***, u_int **, const char **);
++#endif
++
+ /* server-fn.c */
+ void	 server_redraw_client(struct client *);
+ void	 server_status_client(struct client *);
+diff --git a/tty.c b/tty.c
+--- a/tty.c	2026-04-10 22:22:29.887163248 -0600
++++ b/tty.c	2026-04-10 22:22:24.715650540 -0600
+@@ -1558,7 +1558,7 @@
+ 
+ 	if (c->session->curw->window != wp->window)
+ 		return (0);
+-	if (wp->layout_cell == NULL)
++	if (wp->layout_cell == NULL && !(wp->flags & PANE_FLOATING))
+ 		return (0);
+ 
+ 	/* Set the properties relevant to the current client. */
+@@ -2368,11 +2368,17 @@
+ 	int			 fallback;
+ 
+ 	fallback = 0;
++	log_debug("%s: TERM_SIXEL=%d TTYC_SXL=%d xpixel=%u ypixel=%u",
++	    __func__,
++	    !!(tty->term->flags & TERM_SIXEL),
++	    tty_term_has(tty->term, TTYC_SXL),
++	    tty->xpixel, tty->ypixel);
+ 	if ((~tty->term->flags & TERM_SIXEL) &&
+ 	    !tty_term_has(tty->term, TTYC_SXL))
+ 		fallback = 1;
+ 	if (tty->xpixel == 0 || tty->ypixel == 0)
+ 		fallback = 1;
++	log_debug("%s: fallback=%d", __func__, fallback);
+ 
+ 	sixel_size_in_cells(si, &sx, &sy);
+ 	log_debug("%s: image is %ux%u", __func__, sx, sy);
+@@ -2393,7 +2399,32 @@
+ 		return;
+ 	}
+ 
++	/* Wrap the draw in a synchronized update so WezTerm (or any outer
++	 * terminal) doesn't flash the blank cells before the sixel lands. */
++	int sixel_sync = !(tty->flags & TTY_SYNCING);
++	if (sixel_sync)
++		tty_sync_start(tty);
+ 	tty_sixelimage_draw(tty, ctx, si, i, j, rx, ry, x, y);
++	if (sixel_sync)
++		tty_sync_end(tty);
++}
++
++void
++tty_draw_overlay_image(struct tty *tty, struct sixel_image *si,
++    u_int x, u_int y, u_int sx, u_int sy)
++{
++	struct tty_ctx	ctx;
++
++	memset(&ctx, 0, sizeof ctx);
++	ctx.arg = NULL;
++	{
++		int	overlay_sync = !(tty->flags & TTY_SYNCING);
++		if (overlay_sync)
++			tty_sync_start(tty);
++		tty_sixelimage_draw(tty, &ctx, si, 0, 0, sx, sy, x, y);
++		if (overlay_sync)
++			tty_sync_end(tty);
++	}
+ }
+ #endif
+ 

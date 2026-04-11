@@ -8,13 +8,15 @@ showing through transparent areas.
 
 ```
 tmux overlay-image set X Y FILE [-W cols] [-H rows]
+tmux overlay-image animate X Y FILE [-W cols] [-H rows]
 tmux overlay-image clear
 ```
 
 - **X Y** — cell coordinates (column, row) on the terminal screen
-- **FILE** — `.png` (auto-converted with alpha) or pre-encoded `.six`
+- **FILE** — `.png`/`.six` for `set`; animated `.gif`/`.webp`/`.apng` for `animate`
 - **-W / -H** — scale to N terminal columns / rows
-- **Transparent** — PNG alpha < 128 shows live terminal content through (P2=1)
+- **Transparent** — alpha < 128 shows live terminal content through (P2=1)
+- **Per-frame durations** — extracted from the animation file metadata automatically
 - **Flicker-free** — redraws within every pane sync block
 
 ## Apply to tmux
@@ -44,7 +46,8 @@ See [`tools/README.md`](tools/README.md) for:
 
 ## Requirements
 
-- tmux built from source with sixel support
-- Python 3 + Pillow (`pip install Pillow`) for PNG conversion
+- tmux built from source with sixel support (`--enable-sixel`)
+- giflib 5.x (`brew install giflib` or `apt install libgif-dev`) for `animate`
+- Python 3 + Pillow (`pip install Pillow`) for PNG transparency (`set` with `.png`)
 - A terminal with sixel support (WezTerm, xterm, mlterm, etc.)
 - `set -ga terminal-features '*:sync'` in `~/.tmux.conf`

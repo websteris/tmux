@@ -6,43 +6,48 @@ Utilities for the `overlay-image` tmux command added by this fork.
 
 ```
 tmux overlay-image set X Y FILE [-W cols] [-H rows]
+tmux overlay-image animate X Y FILE [-W cols] [-H rows]
 tmux overlay-image clear
 ```
 
-Places a sixel image at screen cell (X, Y). PNG files with alpha are
-automatically converted using `png_to_sixel.py`. `-W`/`-H` scale the
-image to the given number of terminal columns/rows.
+`set` places a static sixel image at screen cell (X, Y). PNG files with alpha
+are automatically converted. `animate` loads an animated GIF, WebP, or APNG
+and plays it in-place using per-frame durations from the file metadata.
+
+`-W`/`-H` scale to the given number of terminal columns/rows.
 
 ## Tools
 
 ### png_to_sixel.py
 Converts a PNG with alpha channel to sixel format. Transparent pixels
-(alpha < 128) use P2=1 — they show the existing terminal content through.
+(alpha < 128) use P2=1 — they show existing terminal content through.
 
 ```bash
 python3 png_to_sixel.py input.png [--width PX] [--height PX] > output.six
 ```
 
-### generate_example_frames.py
-Generates a spinning arc animation as PNG frames.
+### animated_to_sixel.py
+Extracts frames and per-frame durations from an animated image (GIF, WebP,
+APNG) and writes a framed sixel stream consumed by `overlay-image animate`.
+Called automatically by the C command — not normally invoked by hand.
 
 ```bash
-python3 generate_example_frames.py --output-dir ./my-frames --frames 24 --size 120
+python3 animated_to_sixel.py input.gif [--width PX] [--height PX]
 ```
 
-### animate-overlay.sh
-Cycles through pre-converted .six frame files to animate the overlay.
+### generate_example_frames.py
+Generates a 24-frame spinning arc animation as RGBA PNG frames.
 
 ```bash
-# Convert frames first:
-for f in my-frames/frame_*.png; do
-    python3 png_to_sixel.py "$f" --width 120 --height 120 > "${f%.png}.six"
-done
+python3 generate_example_frames.py
+```
 
-# Animate at col 10, row 3, 12fps:
-./animate-overlay.sh 10 3 my-frames 12
+### thinking.gif
+Ready-to-use spinning arc animation (24 frames, 40ms/frame):
+
+```bash
+tmux overlay-image animate 5 2 tools/thinking.gif -W 8 -H 4
 ```
 
 ## Requirements
 - Python 3 with Pillow (`pip install Pillow`)
-- `bc` for shell delay calculation
